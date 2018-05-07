@@ -26,22 +26,25 @@ author: @chengsteven
 """
 
 # TODO LIST:
-# - input password
+# - fsync doesn't work (used by vim)
 # - process separation
 # - cache
 # - performance reviews on normal structure
 # - restructure with data files and metadata files
 # - performance reviews on restructured
-# -
 
 from __future__ import print_function, absolute_import, division
 
 import logging
 import os
-
 import json
-
+import hashlib
+import getpass
 import cryptography
+import ast
+
+import psutil
+
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 
@@ -50,24 +53,55 @@ from errno import EACCES
 from os.path import realpath
 from threading import Lock
 
-from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+from time import time
+
+from stat import S_IFREG
+
+from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
+
+def check_process(func):
+    def wrapper(*args):
+        self = args[0]
+        uid, gid, pid = fuse_get_context()
+        init_process = psutil.Process(pid)
+        current_process = init_process
+        allowed = False
+        last_pid = None
+        if current_process.ppid() == 0: allowed = True
+        self.log.debug("proc white list: %s", self.proc_wl)
+        while current_process.pid != last_pid and allowed == False:
+            self.log.debug("loop: %s %s", current_process.pid, last_pid)
+            last_pid = current_process.pid
+            if current_process.pid in self.proc_wl:
+                allowed = True
+                break
+            current_process = psutil.Process(current_process.ppid())
+        if allowed: return func(*args)
+        else:
+            self.log.debug("PROCESS BLOCKED: %s", init_process)
+            raise FuseOSError(errno.EACCES)
+        return func(*args)
+    return wrapper
 
 
 class steven_encfs(LoggingMixIn, Operations):
-    def __init__(self, root):
+    def __init__(self, root, pw_hash, init_pid):
         self.root = realpath(root)
         self.rwlock = Lock()
         self.block_size = 32 #bytes
         self.log = logging.getLogger('fuse.log-mixin')
-        self.key = b"0123456789012345"
+        self.key = pw_hash
         self.cipher = Cipher(algorithms.AES(self.key), modes.ECB(), backend=default_backend())
         self.encryptor = self.cipher.encryptor()
         self.decryptor = self.cipher.decryptor()
-#        self.st_size_dict = dict()
-        self.st_size_dict = None
+        self.st_size_dict = dict()
         self.st_size_dict_fh = None
+        self.proc_wl_file = self.root + "/proc_wl" # process white list
+        self.proc_wl_fh = None
+        self.proc_wl = [os.getpid(), init_pid]
         self.st_size_dict_path = self.root + "/st_size_dict"
 
+    @check_process
     def __call__(self, op, path, *args):
         return super(steven_encfs, self).__call__(op, self.root + path, *args)
 
@@ -75,10 +109,8 @@ class steven_encfs(LoggingMixIn, Operations):
         self.log.debug("------------ init -------------")
         self.st_size_dict_fh = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
         st = os.lstat(self.st_size_dict_path)
-#        import pdb; pdb.set_trace()
         if (st.st_size):
             self.st_size_dict = json.loads(os.read(self.st_size_dict_fh, st.st_size).decode('utf-8')) # load all the st_size data
-        else: self.st_size_dict = dict()
 
     def destroy(self, path):
         os.lseek(self.st_size_dict_fh, 0, 0)
@@ -87,6 +119,7 @@ class steven_encfs(LoggingMixIn, Operations):
         pass
 
     def access(self, path, mode):
+        if path == self.proc_wl_file: return None
         if not os.access(path, mode):
             raise FuseOSError(EACCES)
 
@@ -97,15 +130,17 @@ class steven_encfs(LoggingMixIn, Operations):
         return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
 
     def flush(self, path, fh):
-        return os.fsync(fh)
+        return 0
+#        return os.fsync(fh)
 
     def fsync(self, path, datasync, fh):
-        if datasync != 0:
-            return os.fdatasync(fh)
-        else:
-            return os.fsync(fh)
+        return 0
+#        return os.fsync(fh)
 
     def getattr(self, path, fh=None):
+        self.log.debug("------------- getattr %s -------------", path)
+        if path == self.proc_wl_file:
+            return {'st_atime':time(), 'st_ctime':time(), 'st_mode':33188, 'st_mtime':time(), 'st_nlink':1, 'st_size':len(str(self.proc_wl))}
         st = os.lstat(path)
         ret_st = dict((key, getattr(st, key)) for key in (
             'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime',
@@ -122,7 +157,12 @@ class steven_encfs(LoggingMixIn, Operations):
     listxattr = None
     mkdir = os.mkdir
     mknod = os.mknod
-    open = os.open
+#    open = os.open
+
+    def open(self, path, flags):
+        if path == self.proc_wl_file: return 0
+        else:
+            return os.open(path, flags)
 
     def read_block(self, path, start_block, num_blocks, fh):
         self.log.debug("------------------ read_block ------------------")
@@ -131,6 +171,7 @@ class steven_encfs(LoggingMixIn, Operations):
             return os.read(fh, num_blocks*self.block_size)
 
     def read(self, path, size, offset, fh):
+        if path == self.proc_wl_file: return str(self.proc_wl).encode()
         self.log.debug("------------------ read ------------------")
         start_block = offset // self.block_size
         num_blocks = size // self.block_size
@@ -147,12 +188,15 @@ class steven_encfs(LoggingMixIn, Operations):
 
     def readdir(self, path, fh):
         fn = os.listdir(path)
+        self.log.debug("-------------------------- readdir %s %s -----------------------", path, self.root + "/")
+        if (path == (self.root + "/")): fn.append("proc_wl")
         if ('st_size_dict' in fn): fn.remove('st_size_dict')
         return ['.', '..'] + fn
 
     readlink = os.readlink
 
     def release(self, path, fh):
+        if path == self.proc_wl_file: return 0
         return os.close(fh)
 
     def rename(self, old, new):
@@ -170,10 +214,17 @@ class steven_encfs(LoggingMixIn, Operations):
         return os.symlink(source, target)
 
     def truncate(self, path, length, fh=None):
-        with open(path, 'r+') as f:
-            f.truncate(length)
+        if path == self.proc_wl_file: return None
+        self.st_size_dict[path] = length
+        truncated_length = length // self.block_size
+        if length % self.block_size != 0: truncated_length += 1
+        os.truncate(path, truncated_length)
 
-    unlink = os.unlink
+    def unlink(self, path):
+        st = self.getattr(path)
+        if (st['st_nlink'] == 1): del self.st_size_dict[path]
+        os.unlink(path)
+
     utimens = os.utime
 
     def write_block(self, path, block_data, start_block, fh):
@@ -185,6 +236,12 @@ class steven_encfs(LoggingMixIn, Operations):
     def write(self, path, data, offset, fh):
         self.log.debug("------------------ write ------------------")
         data_len = len(data)
+        if path == self.proc_wl_file:
+            wl_str = str(self.proc_wl)
+            wl_str = wl_str[:offset] + data.decode() + wl_str[(offset + data_len) : ]
+            wl_str = wl_str[wl_str.index("["):wl_str.index("]") + 1]
+            self.proc_wl = ast.literal_eval(wl_str)
+            return data_len
         if (path not in self.st_size_dict): self.st_size_dict[path] = 0
         self.st_size_dict[path] = max(self.st_size_dict[path], offset + data_len)
         start_block = offset // self.block_size
@@ -215,12 +272,17 @@ class steven_encfs(LoggingMixIn, Operations):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('encdir')
-    parser.add_argument('mount')
+    parser = argparse.ArgumentParser(description="Steven's EncFS")
+    parser.add_argument('encdir', help="the root directory containing the encrypted file system.")
+    parser.add_argument('mount', help="the root directory of where your new mounted file system.")
+    parser.add_argument('init_pid', help="the pid of the first process who will be given access. preferably a shell pid")
+
+    # expecting a certain environment variable
+    #pw_hash = hashlib.sha256(getpass.getpass("Please input a password to decrypt to FS: ").encode()).digest()
+    pw_hash = hashlib.sha256("hello".encode()).digest()
+
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG)
     fuse = FUSE(
-        steven_encfs(args.encdir), args.mount, foreground=True, allow_other=True)
-
+        steven_encfs(args.encdir, pw_hash, int(args.init_pid)), args.mount, foreground=True, allow_other=True)
