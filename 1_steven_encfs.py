@@ -26,9 +26,6 @@ author: @chengsteven
 """
 
 # TODO LIST:
-# - fsync doesn't work (used by vim)
-# - process separation
-# - cache
 # - performance reviews on normal structure
 # - restructure with data files and metadata files
 # - performance reviews on restructured
@@ -68,9 +65,7 @@ def check_process(func):
         allowed = False
         last_pid = None
         if current_process.ppid() == 0: allowed = True
-        self.log.debug("proc white list: %s", self.proc_wl)
         while current_process.pid != last_pid and allowed == False:
-            self.log.debug("loop: %s %s", current_process.pid, last_pid)
             last_pid = current_process.pid
             if current_process.pid in self.proc_wl:
                 allowed = True
@@ -95,58 +90,72 @@ class steven_encfs(LoggingMixIn, Operations):
         self.encryptor = self.cipher.encryptor()
         self.decryptor = self.cipher.decryptor()
         self.st_size_dict = dict()
-        self.st_size_dict_fh = None
-        self.proc_wl_file = self.root + "/proc_wl" # process white list
-        self.proc_wl_fh = None
+        self.proc_wl_path = self.root + "/proc_wl" # process white list
         self.proc_wl = [os.getpid(), init_pid]
         self.st_size_dict_path = self.root + "/st_size_dict"
+        self.fn_dict = {} # mapping of the hashed fn to the real fn
 
     @check_process
     def __call__(self, op, path, *args):
         return super(steven_encfs, self).__call__(op, self.root + path, *args)
 
-    def init(self, path):
+    def init(self, conn):
         self.log.debug("------------ init -------------")
-        self.st_size_dict_fh = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
+        fd = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
         st = os.lstat(self.st_size_dict_path)
         if (st.st_size):
-            self.st_size_dict = json.loads(os.read(self.st_size_dict_fh, st.st_size).decode('utf-8')) # load all the st_size data
+            raw_read = self.read(self.st_size_dict_path, st.st_size, 0, fd)
+            self.st_size_dict = json.loads(raw_read[:raw_read.index(b"}") + 1].decode('utf-8')) # load all the st_size data
+        os.close(fd)
+        os.remove(self.st_size_dict_path)
 
-    def destroy(self, path):
-        os.lseek(self.st_size_dict_fh, 0, 0)
-        os.write(self.st_size_dict_fh, json.dumps(self.st_size_dict).encode('utf-8'))
-        os.close(self.st_size_dict_fh)
-        pass
+    def destroy(self, private_data):
+        fd = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
+        os.lseek(fd, 0, 0)
+        self.write(self.st_size_dict_path, json.dumps(self.st_size_dict).encode('utf-8'), 0, fd)
+        os.close(fd)
+
+    def path_obfuscate(self, path):
+        if path == self.root + "/":
+            return path
+        obfs_path = path + "_obfs"
+        return obfs_path
+
+    def path_deobfuscate(self, path):
+        if path == self.root + "/":
+            return path
+        return path[:-5]
 
     def access(self, path, mode):
-        if path == self.proc_wl_file: return None
-        if not os.access(path, mode):
+        obfs_path = self.path_obfuscate(path)
+        if path == self.proc_wl_path: return None
+        if not os.access(obfs_path, mode):
             raise FuseOSError(EACCES)
 
     chmod = os.chmod
     chown = os.chown
 
     def create(self, path, mode):
-        return os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        obfs_path = self.path_obfuscate(path)
+        return os.open(obfs_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
 
     def flush(self, path, fh):
         return 0
-#        return os.fsync(fh)
 
     def fsync(self, path, datasync, fh):
         return 0
-#        return os.fsync(fh)
 
     def getattr(self, path, fh=None):
-        self.log.debug("------------- getattr %s -------------", path)
-        if path == self.proc_wl_file:
+        #self.log.debug("------------- getattr %s -------------", path)
+        obfs_path = self.path_obfuscate(path)
+        if path == self.proc_wl_path:
             return {'st_atime':time(), 'st_ctime':time(), 'st_mode':33188, 'st_mtime':time(), 'st_nlink':1, 'st_size':len(str(self.proc_wl))}
-        st = os.lstat(path)
+        st = os.lstat(obfs_path)
         ret_st = dict((key, getattr(st, key)) for key in (
             'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime',
             'st_nlink', 'st_uid'))
-        if (path not in self.st_size_dict): self.st_size_dict[path] = 0
-        ret_st['st_size'] = self.st_size_dict[path]
+        if (obfs_path not in self.st_size_dict): self.st_size_dict[obfs_path] = 0
+        ret_st['st_size'] = self.st_size_dict[obfs_path]
         return ret_st
 
     getxattr = None
@@ -155,23 +164,30 @@ class steven_encfs(LoggingMixIn, Operations):
         return os.link(self.root + source, target)
 
     listxattr = None
-    mkdir = os.mkdir
+#    mkdir = os.mkdir
+
+    def mkdir(self, path, mode):
+        obfs_path = self.path_obfuscate(path)
+        os.mkdir(obfs_path, mode)
+
     mknod = os.mknod
-#    open = os.open
 
     def open(self, path, flags):
-        if path == self.proc_wl_file: return 0
+        obfs_path = self.path_obfuscate(path)
+        if obfs_path == self.proc_wl_path: return 0
         else:
-            return os.open(path, flags)
+            return os.open(obfs_path, flags)
 
     def read_block(self, path, start_block, num_blocks, fh):
         self.log.debug("------------------ read_block ------------------")
+        obfs_path = self.path_obfuscate(path)
         with self.rwlock:
             os.lseek(fh, start_block*self.block_size, 0)
             return os.read(fh, num_blocks*self.block_size)
 
     def read(self, path, size, offset, fh):
-        if path == self.proc_wl_file: return str(self.proc_wl).encode()
+        obfs_path = self.path_obfuscate(path)
+        if obfs_path == self.proc_wl_path: return str(self.proc_wl).encode()
         self.log.debug("------------------ read ------------------")
         start_block = offset // self.block_size
         num_blocks = size // self.block_size
@@ -187,16 +203,18 @@ class steven_encfs(LoggingMixIn, Operations):
         return pt[start : (start + size)]
 
     def readdir(self, path, fh):
-        fn = os.listdir(path)
-        self.log.debug("-------------------------- readdir %s %s -----------------------", path, self.root + "/")
+        obfs_path = self.path_obfuscate(path)
+#        import pdb; pdb.set_trace()
+        fn = [self.path_deobfuscate(f) for f in os.listdir(obfs_path)]
+        self.log.debug("-------------------------- readdir %s %s -----------------------", obfs_path, self.root + "/")
         if (path == (self.root + "/")): fn.append("proc_wl")
-        if ('st_size_dict' in fn): fn.remove('st_size_dict')
         return ['.', '..'] + fn
 
     readlink = os.readlink
 
     def release(self, path, fh):
-        if path == self.proc_wl_file: return 0
+        obfs_path = self.path_obfuscate(path)
+        if path == self.proc_wl_path: return 0
         return os.close(fh)
 
     def rename(self, old, new):
@@ -205,7 +223,8 @@ class steven_encfs(LoggingMixIn, Operations):
     rmdir = os.rmdir
 
     def statfs(self, path):
-        stv = os.statvfs(path)
+        obfs_path = self.path_obfuscate(path)
+        stv = os.statvfs(obfs_path)
         return dict((key, getattr(stv, key)) for key in (
             'f_bavail', 'f_bfree', 'f_blocks', 'f_bsize', 'f_favail',
             'f_ffree', 'f_files', 'f_flag', 'f_frsize', 'f_namemax'))
@@ -214,43 +233,48 @@ class steven_encfs(LoggingMixIn, Operations):
         return os.symlink(source, target)
 
     def truncate(self, path, length, fh=None):
-        if path == self.proc_wl_file: return None
-        self.st_size_dict[path] = length
+        obfs_path = self.path_obfuscate(path)
+        if path == self.proc_wl_path: return None
+        self.st_size_dict[obfs_path] = length
         truncated_length = length // self.block_size
         if length % self.block_size != 0: truncated_length += 1
-        os.truncate(path, truncated_length)
+        os.truncate(obfs_path, truncated_length)
 
     def unlink(self, path):
-        st = self.getattr(path)
-        if (st['st_nlink'] == 1): del self.st_size_dict[path]
-        os.unlink(path)
+        obfs_path = self.path_obfuscate(path)
+        st = self.getattr(obfs_path)
+        if (st['st_nlink'] == 1): del self.st_size_dict[obfs_path]
+        os.unlink(obfs_path)
 
     utimens = os.utime
 
     def write_block(self, path, block_data, start_block, fh):
+        obfs_path = self.path_obfuscate(path)
         self.log.debug("------------------ write_block ------------------")
         with self.rwlock:
             os.lseek(fh, start_block*self.block_size, 0)
             return os.write(fh, block_data)
 
     def write(self, path, data, offset, fh):
+        obfs_path = self.path_obfuscate(path)
         self.log.debug("------------------ write ------------------")
         data_len = len(data)
-        if path == self.proc_wl_file:
+        if path == self.proc_wl_path:
             wl_str = str(self.proc_wl)
             wl_str = wl_str[:offset] + data.decode() + wl_str[(offset + data_len) : ]
             wl_str = wl_str[wl_str.index("["):wl_str.index("]") + 1]
             self.proc_wl = ast.literal_eval(wl_str)
             return data_len
-        if (path not in self.st_size_dict): self.st_size_dict[path] = 0
-        self.st_size_dict[path] = max(self.st_size_dict[path], offset + data_len)
+        if (obfs_path not in self.st_size_dict): self.st_size_dict[obfs_path] = 0
+        self.st_size_dict[obfs_path] = max(self.st_size_dict[obfs_path], offset + data_len)
         start_block = offset // self.block_size
         num_blocks = data_len // self.block_size
         if (data_len % self.block_size): num_blocks += 1
         if num_blocks == 0: return 0
 
-        new_fh = os.open(path, os.O_RDONLY)
+        new_fh = os.open(obfs_path, os.O_RDONLY)
         rb_data = self.read_block(path, start_block, num_blocks, new_fh)
+        self.log.debug("readblock data: %s\n", rb_data)
         os.close(new_fh)
 
         # new data
