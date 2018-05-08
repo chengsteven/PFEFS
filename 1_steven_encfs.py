@@ -39,7 +39,7 @@ import hashlib
 import getpass
 import cryptography
 import ast
-
+import base64
 import psutil
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -89,11 +89,12 @@ class steven_encfs(LoggingMixIn, Operations):
         self.cipher = Cipher(algorithms.AES(self.key), modes.ECB(), backend=default_backend())
         self.encryptor = self.cipher.encryptor()
         self.decryptor = self.cipher.decryptor()
-        self.st_size_dict = dict()
         self.proc_wl_path = self.root + "/proc_wl" # process white list
         self.proc_wl = [os.getpid(), init_pid]
         self.st_size_dict_path = self.root + "/st_size_dict"
-        self.fn_dict = {} # mapping of the hashed fn to the real fn
+        self.st_size_dict = dict()
+        self.obfs_fn_path = self.root + "/obfs_fn"
+        self.obfs_fn = dict() # mapping of the hashed fn to the real fn
 
     @check_process
     def __call__(self, op, path, *args):
@@ -103,28 +104,48 @@ class steven_encfs(LoggingMixIn, Operations):
         self.log.debug("------------ init -------------")
         fd = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
         st = os.lstat(self.st_size_dict_path)
+        fd2 = os.open(self.obfs_fn_path, os.O_CREAT | os.O_RDWR)
+        st2 = os.lstat(self.obfs_fn_path)
         if (st.st_size):
             raw_read = self.read(self.st_size_dict_path, st.st_size, 0, fd)
             self.st_size_dict = json.loads(raw_read[:raw_read.index(b"}") + 1].decode('utf-8')) # load all the st_size data
+        if (st2.st_size):
+            raw_read2 = self.read(self.obfs_fn_path, st2.st_size, 0, fd2)
+            self.obfs_fn = json.loads(raw_read2[:raw_read2.index(b"}") + 1].decode('utf-8'))
         os.close(fd)
+        os.close(fd2)
         os.remove(self.st_size_dict_path)
+        os.remove(self.obfs_fn_path)
 
     def destroy(self, private_data):
         fd = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
+        fd2 = os.open(self.obfs_fn_path, os.O_CREAT | os.O_RDWR)
         os.lseek(fd, 0, 0)
-        self.write(self.st_size_dict_path, json.dumps(self.st_size_dict).encode('utf-8'), 0, fd)
+        os.lseek(fd2, 0, 0)
+        self.write(self.st_size_dict_path, json.dumps(self.st_size_dict).encode('utf-8'), 0, fd, False)
+        self.write(self.obfs_fn_path, json.dumps(self.obfs_fn).encode('utf-8'), 0, fd2, False)
         os.close(fd)
+        os.close(fd2)
 
     def path_obfuscate(self, path):
         if path == self.root + "/":
             return path
-        obfs_path = path + "_obfs"
+        rel_path = path.replace(self.root, '')
+        rel_path = [p for p in rel_path.split('/') if len(p) > 0]
+        for i in range(len(rel_path)):
+            p = rel_path[i]
+            obfsed = base64.b16encode(hashlib.sha256(p.encode()).digest()).decode()
+            self.obfs_fn[obfsed] = p
+            rel_path[i] = obfsed
+        obfs_path = self.root
+        for p in rel_path:
+            obfs_path += "/" + p
         return obfs_path
 
     def path_deobfuscate(self, path):
         if path == self.root + "/":
             return path
-        return path[:-5]
+        return self.obfs_fn[path]
 
     def access(self, path, mode):
         obfs_path = self.path_obfuscate(path)
@@ -132,8 +153,15 @@ class steven_encfs(LoggingMixIn, Operations):
         if not os.access(obfs_path, mode):
             raise FuseOSError(EACCES)
 
-    chmod = os.chmod
-    chown = os.chown
+    def chmod(self, path, mode):
+        obfs_path = self.path_obfuscate(path)
+        if path == self.proc_wl_path: raise FuseOSError(EACCES)
+        os.chmod(obfs_path, mode)
+
+    def chown(self, path, mode):
+        obfs_path = self.path_obfuscate(path)
+        if path == self.proc_wl_path: raise FuseOSError(EACCES)
+        os.chown(obfs_path, mode)
 
     def create(self, path, mode):
         obfs_path = self.path_obfuscate(path)
@@ -146,7 +174,6 @@ class steven_encfs(LoggingMixIn, Operations):
         return 0
 
     def getattr(self, path, fh=None):
-        #self.log.debug("------------- getattr %s -------------", path)
         obfs_path = self.path_obfuscate(path)
         if path == self.proc_wl_path:
             return {'st_atime':time(), 'st_ctime':time(), 'st_mode':33188, 'st_mtime':time(), 'st_nlink':1, 'st_size':len(str(self.proc_wl))}
@@ -164,13 +191,14 @@ class steven_encfs(LoggingMixIn, Operations):
         return os.link(self.root + source, target)
 
     listxattr = None
-#    mkdir = os.mkdir
 
     def mkdir(self, path, mode):
         obfs_path = self.path_obfuscate(path)
         os.mkdir(obfs_path, mode)
 
-    mknod = os.mknod
+    def mknod(self, path, mode):
+        obfs_path = self.path_obfuscate(path)
+        os.mknod(obfs_path, mode)
 
     def open(self, path, flags):
         obfs_path = self.path_obfuscate(path)
@@ -204,13 +232,14 @@ class steven_encfs(LoggingMixIn, Operations):
 
     def readdir(self, path, fh):
         obfs_path = self.path_obfuscate(path)
-#        import pdb; pdb.set_trace()
         fn = [self.path_deobfuscate(f) for f in os.listdir(obfs_path)]
         self.log.debug("-------------------------- readdir %s %s -----------------------", obfs_path, self.root + "/")
         if (path == (self.root + "/")): fn.append("proc_wl")
         return ['.', '..'] + fn
 
-    readlink = os.readlink
+    def readlink(self, path):
+        obfs_path = self.path_obfuscate(path)
+        return os.readlink(obfs_path)
 
     def release(self, path, fh):
         obfs_path = self.path_obfuscate(path)
@@ -220,7 +249,10 @@ class steven_encfs(LoggingMixIn, Operations):
     def rename(self, old, new):
         return os.rename(old, self.root + new)
 
-    rmdir = os.rmdir
+    def rmdir(self, path):
+        obfs_path = self.path_obfuscate(path)
+        del self.st_size_dict[obfs_path]
+        return os.rmdir(obfs_path)
 
     def statfs(self, path):
         obfs_path = self.path_obfuscate(path)
@@ -242,7 +274,7 @@ class steven_encfs(LoggingMixIn, Operations):
 
     def unlink(self, path):
         obfs_path = self.path_obfuscate(path)
-        st = self.getattr(obfs_path)
+        st = self.getattr(path)
         if (st['st_nlink'] == 1): del self.st_size_dict[obfs_path]
         os.unlink(obfs_path)
 
@@ -255,8 +287,11 @@ class steven_encfs(LoggingMixIn, Operations):
             os.lseek(fh, start_block*self.block_size, 0)
             return os.write(fh, block_data)
 
-    def write(self, path, data, offset, fh):
-        obfs_path = self.path_obfuscate(path)
+    def write(self, path, data, offset, fh, obfs=True):
+        if obfs:
+            obfs_path = self.path_obfuscate(path)
+        else:
+            obfs_path = path
         self.log.debug("------------------ write ------------------")
         data_len = len(data)
         if path == self.proc_wl_path:
@@ -301,9 +336,7 @@ if __name__ == '__main__':
     parser.add_argument('mount', help="the root directory of where your new mounted file system.")
     parser.add_argument('init_pid', help="the pid of the first process who will be given access. preferably a shell pid")
 
-    # expecting a certain environment variable
-    #pw_hash = hashlib.sha256(getpass.getpass("Please input a password to decrypt to FS: ").encode()).digest()
-    pw_hash = hashlib.sha256("hello".encode()).digest()
+    pw_hash = hashlib.sha256(getpass.getpass("Please input a password to decrypt to FS: ").encode()).digest()
 
     args = parser.parse_args()
 
