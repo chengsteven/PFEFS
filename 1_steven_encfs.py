@@ -25,11 +25,6 @@ written and read are encrypted/decrypted respectively.
 author: @chengsteven
 """
 
-# TODO LIST:
-# - performance reviews on normal structure
-# - restructure with data files and metadata files
-# - performance reviews on restructured
-
 from __future__ import print_function, absolute_import, division
 
 import logging
@@ -41,6 +36,7 @@ import cryptography
 import ast
 import base64
 import psutil
+import struct
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -86,9 +82,6 @@ class steven_encfs(LoggingMixIn, Operations):
         self.block_size = 32 #bytes
         self.log = logging.getLogger('fuse.log-mixin')
         self.key = pw_hash
-        self.cipher = Cipher(algorithms.AES(self.key), modes.ECB(), backend=default_backend())
-        self.encryptor = self.cipher.encryptor()
-        self.decryptor = self.cipher.decryptor()
         self.proc_wl_path = self.root + "/proc_wl" # process white list
         self.proc_wl = [os.getpid(), init_pid]
         self.st_size_dict_path = self.root + "/st_size_dict"
@@ -106,6 +99,7 @@ class steven_encfs(LoggingMixIn, Operations):
         st = os.lstat(self.st_size_dict_path)
         fd2 = os.open(self.obfs_fn_path, os.O_CREAT | os.O_RDWR)
         st2 = os.lstat(self.obfs_fn_path)
+        import pdb; pdb.set_trace()
         if (st.st_size):
             raw_read = self.read(self.st_size_dict_path, st.st_size, 0, fd)
             self.st_size_dict = json.loads(raw_read[:raw_read.index(b"}") + 1].decode('utf-8')) # load all the st_size data
@@ -224,7 +218,17 @@ class steven_encfs(LoggingMixIn, Operations):
 
         # decryption here
         self.log.debug("----------- read ct: " + str(rb_data) + " -----------")
-        pt = self.decryptor.update(rb_data)
+        pt = b""
+        rb_data_len = len(rb_data)
+        i = 0
+        while len(pt) < rb_data_len:
+            ct = rb_data[:self.block_size]
+            tweak1, tweak2 = start_block + i*self.block_size // 256, start_block + i*self.block_size % 256
+            decryptor = Cipher(algorithms.AES(self.key), modes.XTS(struct.pack('>QQ', tweak1, tweak2)), backend=default_backend()).decryptor()
+            pt += decryptor.update(ct)
+            rb_data = rb_data[self.block_size:]
+            i += 1
+
         self.log.debug("----------- read pt: " + str(pt) + " -----------")
 
         start = offset % self.block_size
@@ -320,7 +324,16 @@ class steven_encfs(LoggingMixIn, Operations):
 
         self.log.debug("----------- write pt: " + str(rb_data) + " -----------")
         # encryption here
-        ct = self.encryptor.update(rb_data)
+        ct = b""
+        rb_data_len = len(rb_data)
+        i = 0
+        while len(ct) < rb_data_len:
+            pt = rb_data[:self.block_size]
+            tweak1, tweak2 = start_block + i*self.block_size // 256, start_block + i*self.block_size % 256
+            encryptor = Cipher(algorithms.AES(self.key), modes.XTS(struct.pack('>QQ', tweak1, tweak2)), backend=default_backend()).encryptor()
+            ct += encryptor.update(pt)
+            rb_data = rb_data[self.block_size:]
+            i += 1
 
         self.log.debug("----------- write ct: " + str(ct) + " -----------")
 
