@@ -99,7 +99,6 @@ class steven_encfs(LoggingMixIn, Operations):
         st = os.lstat(self.st_size_dict_path)
         fd2 = os.open(self.obfs_fn_path, os.O_CREAT | os.O_RDWR)
         st2 = os.lstat(self.obfs_fn_path)
-        import pdb; pdb.set_trace()
         if (st.st_size):
             raw_read = self.read(self.st_size_dict_path, st.st_size, 0, fd)
             self.st_size_dict = json.loads(raw_read[:raw_read.index(b"}") + 1].decode('utf-8')) # load all the st_size data
