@@ -69,12 +69,14 @@ def check_process(func):
             current_process = psutil.Process(current_process.ppid())
         if allowed: return func(*args)
         else:
+            self.log.debug("PROCESS BLOCKED: %s", init_process)
+            self.log.debug("check process: %s", self.proc_wl)
             raise FuseOSError(errno.EACCES)
         return func(*args)
     return wrapper
 
 
-class steven_encfs(Operations):
+class steven_encfs(LoggingMixIn, Operations):
     def __init__(self, root, pw_hash, init_pid):
         self.root = realpath(root)
         self.rwlock = Lock()
@@ -192,7 +194,7 @@ class steven_encfs(Operations):
 
     def open(self, path, flags):
         obfs_path = self.path_obfuscate(path)
-        if obfs_path == self.proc_wl_path: return 0
+        if path == self.proc_wl_path: return 0
         else:
             return os.open(obfs_path, flags)
 
@@ -204,7 +206,7 @@ class steven_encfs(Operations):
 
     def read(self, path, size, offset, fh):
         obfs_path = self.path_obfuscate(path)
-        if obfs_path == self.proc_wl_path: return str(self.proc_wl).encode()
+        if path == self.proc_wl_path: return str(self.proc_wl).encode()
         start_block = offset // self.block_size
         num_blocks = size // self.block_size
         if (size % self.block_size): num_blocks += 1
