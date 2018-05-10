@@ -69,18 +69,16 @@ def check_process(func):
             current_process = psutil.Process(current_process.ppid())
         if allowed: return func(*args)
         else:
-            self.log.debug("PROCESS BLOCKED: %s", init_process)
             raise FuseOSError(errno.EACCES)
         return func(*args)
     return wrapper
 
 
-class steven_encfs(LoggingMixIn, Operations):
+class steven_encfs(Operations):
     def __init__(self, root, pw_hash, init_pid):
         self.root = realpath(root)
         self.rwlock = Lock()
         self.block_size = 32 #bytes
-        self.log = logging.getLogger('fuse.log-mixin')
         self.key = pw_hash
         self.proc_wl_path = self.root + "/proc_wl" # process white list
         self.proc_wl = [os.getpid(), init_pid]
@@ -94,7 +92,6 @@ class steven_encfs(LoggingMixIn, Operations):
         return super(steven_encfs, self).__call__(op, self.root + path, *args)
 
     def init(self, conn):
-        self.log.debug("------------ init -------------")
         fd = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
         st = os.lstat(self.st_size_dict_path)
         fd2 = os.open(self.obfs_fn_path, os.O_CREAT | os.O_RDWR)
@@ -200,7 +197,6 @@ class steven_encfs(LoggingMixIn, Operations):
             return os.open(obfs_path, flags)
 
     def read_block(self, path, start_block, num_blocks, fh):
-        self.log.debug("------------------ read_block ------------------")
         obfs_path = self.path_obfuscate(path)
         with self.rwlock:
             os.lseek(fh, start_block*self.block_size, 0)
@@ -209,14 +205,13 @@ class steven_encfs(LoggingMixIn, Operations):
     def read(self, path, size, offset, fh):
         obfs_path = self.path_obfuscate(path)
         if obfs_path == self.proc_wl_path: return str(self.proc_wl).encode()
-        self.log.debug("------------------ read ------------------")
         start_block = offset // self.block_size
         num_blocks = size // self.block_size
         if (size % self.block_size): num_blocks += 1
         rb_data = self.read_block(path, start_block, num_blocks, fh)
 
         # decryption here
-        self.log.debug("----------- read ct: " + str(rb_data) + " -----------")
+#        pt = rb_data
         pt = b""
         rb_data_len = len(rb_data)
         i = 0
@@ -228,7 +223,6 @@ class steven_encfs(LoggingMixIn, Operations):
             rb_data = rb_data[self.block_size:]
             i += 1
 
-        self.log.debug("----------- read pt: " + str(pt) + " -----------")
 
         start = offset % self.block_size
         return pt[start : (start + size)]
@@ -236,7 +230,6 @@ class steven_encfs(LoggingMixIn, Operations):
     def readdir(self, path, fh):
         obfs_path = self.path_obfuscate(path)
         fn = [self.path_deobfuscate(f) for f in os.listdir(obfs_path)]
-        self.log.debug("-------------------------- readdir %s %s -----------------------", obfs_path, self.root + "/")
         if (path == (self.root + "/")): fn.append("proc_wl")
         return ['.', '..'] + fn
 
@@ -285,7 +278,6 @@ class steven_encfs(LoggingMixIn, Operations):
 
     def write_block(self, path, block_data, start_block, fh):
         obfs_path = self.path_obfuscate(path)
-        self.log.debug("------------------ write_block ------------------")
         with self.rwlock:
             os.lseek(fh, start_block*self.block_size, 0)
             return os.write(fh, block_data)
@@ -295,7 +287,6 @@ class steven_encfs(LoggingMixIn, Operations):
             obfs_path = self.path_obfuscate(path)
         else:
             obfs_path = path
-        self.log.debug("------------------ write ------------------")
         data_len = len(data)
         if path == self.proc_wl_path:
             wl_str = str(self.proc_wl)
@@ -312,7 +303,6 @@ class steven_encfs(LoggingMixIn, Operations):
 
         new_fh = os.open(obfs_path, os.O_RDONLY)
         rb_data = self.read_block(path, start_block, num_blocks, new_fh)
-        self.log.debug("readblock data: %s\n", rb_data)
         os.close(new_fh)
 
         # new data
@@ -321,7 +311,7 @@ class steven_encfs(LoggingMixIn, Operations):
         rb_data = rb_data[:start] + data + rb_data[(start) + data_len:]
 
 
-        self.log.debug("----------- write pt: " + str(rb_data) + " -----------")
+#        ct = rb_data
         # encryption here
         ct = b""
         rb_data_len = len(rb_data)
@@ -329,15 +319,14 @@ class steven_encfs(LoggingMixIn, Operations):
         while len(ct) < rb_data_len:
             pt = rb_data[:self.block_size]
             tweak1, tweak2 = start_block + i*self.block_size // 256, start_block + i*self.block_size % 256
+            # reusing keys with tweaks; consider modifying
             encryptor = Cipher(algorithms.AES(self.key), modes.XTS(struct.pack('>QQ', tweak1, tweak2)), backend=default_backend()).encryptor()
             ct += encryptor.update(pt)
             rb_data = rb_data[self.block_size:]
             i += 1
 
-        self.log.debug("----------- write ct: " + str(ct) + " -----------")
 
         bytes_written = self.write_block(path, ct, start_block, fh)
-        if (bytes_written % self.block_size != 0): self.log.debug("------------------ write error ------------------")
         return data_len
 
 

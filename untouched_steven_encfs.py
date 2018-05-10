@@ -35,7 +35,8 @@ from threading import Lock
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
 
-class steven_encfs(LoggingMixIn, Operations):
+#class steven_encfs(LoggingMixIn, Operations):
+class steven_encfs(Operations):
     def __init__(self, root):
         self.root = realpath(root)
         self.rwlock = Lock()
