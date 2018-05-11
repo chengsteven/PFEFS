@@ -2,7 +2,7 @@
 """
 This FS is written for EN.650.718: Advanced Operating Systems at Johns Hopkins University.
 
-steven_encfs is supposed to be a step up from normal encrypted file systems. Right now,
+PFEFS is supposed to be a step up from normal encrypted file systems. Right now,
 normal encfs provides data protection by encrypting all the data that is written to disk
 and decrypts data that is read from disk. This hides any data on the file system if the
 physical disk were ever compromised i.e. by theft. However, this does not really help
@@ -13,14 +13,11 @@ meaning once a FS has been mounted and verified via a password, any application 
 then access that FS since the OS is already decrypting that data.
 
 
-steven_encfs tries to address these issues by providing a FS that is similar to full
+PFEFS tries to address these issues by providing a FS that is similar to full
 disk encryption. It encrypts all data written and decrypts all data read without knowledge
-by the user. However, we add that separate processes cannot read from a steven_encfs
+by the user. However, we add that separate processes cannot read from a PFEFS
 if they have not been given permission to. We want to protect the data from being
-read in a meaningful way in a steven_encfs by unprivileged processes.
-
-1_steven_encfs.py is a FS that reads and writes in block sizes. The blocks
-written and read are encrypted/decrypted respectively.
+read in a meaningful way in a PFEFS by unprivileged processes.
 
 author: @chengsteven
 """
@@ -76,7 +73,7 @@ def check_process(func):
     return wrapper
 
 
-class steven_encfs(LoggingMixIn, Operations):
+class PFEFS(LoggingMixIn, Operations):
     def __init__(self, root, pw_hash, init_pid):
         self.root = realpath(root)
         self.rwlock = Lock()
@@ -91,7 +88,7 @@ class steven_encfs(LoggingMixIn, Operations):
 
     @check_process
     def __call__(self, op, path, *args):
-        return super(steven_encfs, self).__call__(op, self.root + path, *args)
+        return super(PFEFS, self).__call__(op, self.root + path, *args)
 
     def init(self, conn):
         fd = os.open(self.st_size_dict_path, os.O_CREAT | os.O_RDWR)
@@ -345,4 +342,5 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=logging.DEBUG)
     fuse = FUSE(
-        steven_encfs(args.encdir, pw_hash, int(args.init_pid)), args.mount, foreground=True, allow_other=True)
+        PFEFS(args.encdir, pw_hash, int(args.init_pid)), args.mount, foreground=True, allow_other=True)
+
